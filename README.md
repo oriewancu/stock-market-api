@@ -68,15 +68,13 @@ python3 -m pip install -r requirements.txt
 
 ## Project Structure
 
-Contoh struktur project:
-
 ```text
 stock-market-api/
-│
+├── run.bat
 ├── server.py
 ├── requirements.txt
 ├── README.md
-│
+├── setup.bat
 └── DaftarSaham.xlsx
 ```
 
@@ -89,8 +87,8 @@ stock-market-api/
 ## 1. Clone Repository
 
 ```bash
-git clone <REPOSITORY_URL>
-cd <PROJECT_FOLDER>
+git clone https://github.com/oriewancu/stock-market-api
+cd stock-market-api
 ```
 
 ## 2. Install Dependencies
@@ -752,12 +750,6 @@ Port:
 
 # License
 
-Add your preferred license here.
-
-Example:
-
 ```text
 MIT License
 ```
-
-atau sesuaikan dengan kebutuhan project.
