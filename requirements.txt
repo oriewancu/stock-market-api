@@ -1,6 +1,6 @@
 Flask
-flask-cors
+Flask-Cors
+tvdatafeed
 yfinance
 pandas
-openpyxl
 requests
