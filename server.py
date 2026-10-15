@@ -1,99 +1,258 @@
-"""
-============================================================
-STOCK API SERVER
-============================================================
-
-REQUIREMENTS
-------------
-Python 3.10+ disarankan.
-
-Python libraries:
-    Flask
-    flask-cors
-    yfinance
-    pandas
-    openpyxl
-
-Cara install dependency:
-
-Linux / macOS:
-    python3 -m pip install -r requirements.txt
-
-Windows:
-    py -m pip install -r requirements.txt
-
-Jika pip belum tersedia:
-
-Windows:
-    py -m ensurepip --upgrade
-    py -m pip install --upgrade pip
-
-Linux / macOS:
-    python3 -m ensurepip --upgrade
-    python3 -m pip install --upgrade pip
-
-
-FIRST RUN
----------
-1. Pastikan Python sudah terinstall.
-2. Buka terminal / CMD di folder project.
-3. Install dependency:
-
-       Windows:
-       py -m pip install -r requirements.txt
-
-       Linux/macOS:
-       python3 -m pip install -r requirements.txt
-
-4. Pastikan file berikut berada dalam folder yang sama:
-       server.py
-       requirements.txt
-       Daftar Saham  - 20260924.xlsx
-
-5. Jalankan server:
-
-       Windows:
-       py server.py
-
-       Linux/macOS:
-       python3 server.py
-
-6. Server akan berjalan di:
-       http://127.0.0.1:5000
-
-
-TROUBLESHOOTING
----------------
-Jika pip menggunakan Python yang berbeda dengan Python
-yang menjalankan server, gunakan:
-
-    Windows:
-        py -m pip install -r requirements.txt
-        py server.py
-
-    Linux/macOS:
-        python3 -m pip install -r requirements.txt
-        python3 server.py
-
-============================================================
-"""
-
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from tvDatafeed import TvDatafeed, Interval
+from datetime import datetime, timedelta
 import yfinance as yf
 import pandas as pd
 import requests
 import json
 import os
+import time
 import traceback
 
 app = Flask(__name__)
 CORS(app)
 
+# 1. Inisialisasi TradingView (Guest Mode)
+print("Menginisialisasi TradingView...")
+tv = TvDatafeed()
+print("TradingView Siap!")
+
 @app.route('/api/saham')
 def get_saham():
+    # Ambil parameter sumber data, default ke yfinance
+    sumber_data = request.args.get('data', 'yfinance').lower()
+
+    if sumber_data == 'yfinance':
+        return get_saham_yfinance()
+    elif sumber_data == 'goapi':
+        return get_saham_goapi()
+    elif sumber_data == 'marketstack':
+        return get_saham_marketstack()
+    else:
+        return get_saham_tv()
+
+def get_saham_marketstack():
+    ticker_raw = request.args.get('ticker', 'BBRI').upper()
+    # Hapus .JK bawaan YFinance
+    ticker = ticker_raw.replace('.JK', '')
+    gaya = request.args.get('gaya', 'swing').lower()
+    
+    # API Key Marketstack Anda
+    MARKETSTACK_KEY = "YOUR_MARKETSTACK_KEY"
+    
+    # Marketstack menggunakan MIC code XIDX untuk Bursa Efek Indonesia
+    symbol = f"{ticker}.XIDX"
+    
+    # Jumlah bar: 90 untuk Fast, 260 untuk Swing
+    jumlah_bar = 90 if gaya in ['fast', 'bsjp'] else 260
+    
+    # Endpoint historical EOD Marketstack
+    url = "https://api.marketstack.com/v1/eod"
+    
+    params = {
+        'access_key': MARKETSTACK_KEY,
+        'symbols': symbol,
+        'limit': jumlah_bar
+    }
+    
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        
+        if response.status_code != 200:
+            return jsonify({"error": f"Gagal dari Marketstack. HTTP: {response.status_code} - {response.text}"}), 400
+            
+        data_json = response.json()
+        
+        # Cek apakah ada data di dalam array 'data'
+        results = data_json.get('data', [])
+        
+        if not results:
+            return jsonify({"error": f"Data chart {ticker} kosong di Marketstack!"}), 400
+
+        data_grafik = []
+        for row in results:
+            # Marketstack mereturn tanggal dengan format ISO: "2026-10-14T00:00:00+0000"
+            # Kita potong 10 karakter pertama jadi YYYY-MM-DD
+            raw_date = str(row.get('date', ''))[:10]
+            
+            data_grafik.append({
+                "time": raw_date,
+                "open": float(row.get('open', 0) or 0),
+                "high": float(row.get('high', 0) or 0),
+                "low": float(row.get('low', 0) or 0),
+                "close": float(row.get('close', 0) or 0),
+                "volume": int(row.get('volume', 0) or 0)
+            })
+        
+        # Marketstack mereturn data Descending (Terbaru ke Terlama)
+        # Kita sort menjadi Ascending agar library chart di frontend tidak error
+        data_grafik = sorted(data_grafik, key=lambda x: x['time'])
+            
+        return jsonify({
+            "chart": data_grafik,
+            "profile": {
+                "nama": ticker,
+                "sector": "Bursa Efek Indonesia",
+                "summary": "Data Historikal EOD disediakan oleh Marketstack."
+            }
+        })
+        
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": f"Koneksi ke Marketstack timeout/gagal: {str(e)}"}), 502
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Terjadi kesalahan internal Marketstack: {str(e)}"}), 500
+
+def get_saham_goapi():
+    # GoAPI menggunakan kode saham standar 4 huruf (tanpa .JK)
+    ticker_raw = request.args.get('ticker', 'BBRI').upper()
+    ticker = ticker_raw.replace('.JK', '')
+    gaya = request.args.get('gaya', 'swing').lower()
+    
+    GOAPI_KEY = "YOUR_GOAPI_KEY"
+    
+    # Setup rentang waktu (sesuaikan dengan logic yfinance sebelumnya)
+    # Fast/BSJP = ~3 bulan (90 hari)
+    # Swing = ~1 tahun (365 hari)
+    hari_mundur = 90 if gaya in ['fast', 'bsjp'] else 365
+    
+    end_date = datetime.now().strftime('%Y-%m-%d')
+    start_date = (datetime.now() - timedelta(days=hari_mundur)).strftime('%Y-%m-%d')
+    
+    url_historical = f"https://api.goapi.io/stock/idx/{ticker}/historical"
+    
+    # 1. Sesuaikan Headers sesuai doc API
+    headers = {
+        'accept': 'application/json',
+        'X-API-KEY': GOAPI_KEY
+    }
+    
+    # 2. Sesuaikan parameter tanggal
+    params = {
+        'from': start_date,
+        'to': end_date
+    }
+    
+    try:
+        # Request ke GoAPI
+        response = requests.get(url_historical, headers=headers, params=params, timeout=10)
+        
+        if response.status_code != 200:
+            return jsonify({"error": f"Gagal mengambil data dari GoAPI. HTTP Status: {response.status_code} - {response.text}"}), 400
+            
+        data_json = response.json()
+        
+        if data_json.get('status') != 'success' or 'data' not in data_json:
+            return jsonify({"error": f"Data saham {ticker} tidak ditemukan di GoAPI!"}), 400
+            
+        # Ambil list data dari object JSON
+        results = data_json['data'].get('results', data_json['data']) 
+        
+        if not results:
+            return jsonify({"error": f"Data chart {ticker} kosong dari GoAPI untuk periode {start_date} s/d {end_date}!"}), 400
+
+        data_grafik = []
+        for row in results:
+            # Pastikan tanggal terpotong jadi YYYY-MM-DD saja untuk amannya
+            raw_date = str(row.get('date', ''))[:10]
+            
+            data_grafik.append({
+                "time": raw_date,
+                "open": float(row.get('open', 0)),
+                "high": float(row.get('high', 0)),
+                "low": float(row.get('low', 0)),
+                "close": float(row.get('close', 0)),
+                "volume": int(row.get('volume', 0))
+            })
+        
+        # Sortir grafik dari data lama ke terbaru (Ascending) agar chart bisa render dengan benar
+        data_grafik = sorted(data_grafik, key=lambda x: x['time'])
+            
+        return jsonify({
+            "chart": data_grafik,
+            "profile": {
+                "nama": ticker,
+                "sector": "Bursa Efek Indonesia",
+                "summary": "Data Historikal disediakan oleh GoAPI-ID."
+            }
+        })
+        
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": f"Koneksi ke GoAPI timeout/gagal: {str(e)}"}), 502
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": f"Terjadi kesalahan internal GoAPI: {str(e)}"}), 500
+
+def get_saham_tv():
+    # TradingView tidak memakai .JK, cukup nama ticker dan exchange IDX
+    ticker_raw = request.args.get('ticker', 'BBRI').upper()
+    ticker = ticker_raw.replace('.JK', '')
+    gaya = request.args.get('gaya', 'swing').lower()
+
+    try:
+        # 60 bar untuk FAST/BSJP, 260 bar (1 tahun trading) untuk SWING
+        limit_bars = 60 if gaya in ['fast', 'bsjp'] else 260
+        
+        df = None
+        max_retries = 3
+        
+        # LOOP RETRY MAKSIMAL 3 KALI
+        for attempt in range(max_retries):
+            try:
+                # Ambil data dari bursa IDX
+                df = tv.get_hist(symbol=ticker, exchange='IDX', interval=Interval.in_daily, n_bars=limit_bars)
+                
+                # Jika data berhasil ditarik dan tidak kosong, langsung keluar dari loop
+                if df is not None and not df.empty:
+                    break
+                
+                print(f"[Warning] Percobaan {attempt + 1} gagal fetch {ticker} dari TradingView. Data kosong.")
+                time.sleep(1) # Jeda 1 detik sebelum mencoba lagi
+            except Exception as e:
+                print(f"[Error] Percobaan {attempt + 1} gagal: {e}")
+                if attempt == max_retries - 1:
+                    # Jika sudah percobaan terakhir (ke-3) dan tetap error, lempar ke exception utama
+                    raise e
+                time.sleep(1) # Jeda sebelum retry jika ada exception
+        
+        # Cek hasil akhir setelah loop selesai
+        if df is None or df.empty:
+            return jsonify({"error": f"Data saham {ticker} tidak ditemukan di TradingView setelah {max_retries} kali percobaan!"}), 400
+            
+        # Bersihkan data jika ada baris kosong
+        df = df.dropna(subset=['close'])
+        if df.empty:
+            return jsonify({"error": f"Data saham {ticker} kosong setelah dibersihkan!"}), 400
+
+        data_grafik = []
+        for index, row in df.iterrows():
+            t_str = index.strftime('%Y-%m-%d')
+            data_grafik.append({
+                "time": t_str,
+                "open": float(row['open']),
+                "high": float(row['high']),
+                "low": float(row['low']),
+                "close": float(row['close']),
+                "volume": int(row['volume'])
+            })
+            
+        return jsonify({
+            "chart": data_grafik,
+            "profile": {
+                "nama": ticker,
+                "sector": "IDX Stock",
+                "summary": "Data Real-time disediakan oleh TradingView."
+            }
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": f"Gagal fetch data TradingView: {str(e)}"}), 500
+
+def get_saham_yfinance():
     ticker = request.args.get('ticker', 'BBRI').upper()
-    gaya = request.args.get('gaya', 'swing').lower() # Tangkap parameter gaya bermain
+    gaya = request.args.get('gaya', 'swing').lower()
     
     if not ticker.endswith('.JK'):
         ticker += '.JK'
@@ -102,20 +261,14 @@ def get_saham():
         saham = yf.Ticker(ticker)
         
         # OPTIMASI KECEPATAN (AUTO-REFRESH FRIENDLY)
-        # Kurangi beban load data berdasarkan gaya bermain
         if gaya in ['fast', 'bsjp']:
-            # MA maksimal yang dihitung frontend adalah MA15 & 20 hari (untuk tren bulanan)
-            # period "3mo" (3 bulan) sudah sangat aman, load data jadi super kilat
             df = saham.history(period="3mo", interval="1d")
         else:
-            # Mode swing menghitung MA50, jadi butuh data 6 bulan atau 1 tahun
             df = saham.history(period="1y", interval="1d")
         
         if df.empty:
             return jsonify({"error": f"Data saham {ticker} tidak ditemukan!"}), 400
             
-        # Ambil info profil singkat dari yfinance
-        # (Catatan: Jika kedepannya API sering timeout, bagian .info ini bisa dibuat caching)
         info = saham.info
         nama_pt = info.get('longName', ticker)
         sektor = info.get('sector', 'Sektor Tidak Diketahui')
@@ -133,7 +286,6 @@ def get_saham():
                 "volume": int(row['Volume'])
             })
             
-        # Kirim data chart beserta profil perusahaannya
         return jsonify({
             "chart": data_grafik,
             "profile": {
@@ -145,25 +297,20 @@ def get_saham():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 @app.route('/api/get_idx_tickers', methods=['GET'])
 def get_idx_tickers():
     min_harga = float(request.args.get('min', 0))
     max_harga = float(request.args.get('max', 9999999))
     
-    # 1. Konfigurasi URL Gist dan nama file Excel Fallback
     gist_url = "https://gist.githubusercontent.com/oriewancu/113e249ccfbbd4f62d27c71aa751269f/raw/847ba68dd97c4bc079192c1b892cc94255ef904c/saham.json" 
-
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     excel_file = os.path.join(BASE_DIR, "DaftarSaham.xlsx")
     
     list_emiten = []
     
-    # 2. Coba Mengambil Data dari Gist (Utama)
     try:
-        req = requests.get(gist_url, timeout=5) # Set timeout agar tidak menunggu terlalu lama jika GitHub down
+        req = requests.get(gist_url, timeout=5)
         if req.status_code == 200:
-            # Karena format Gist sekarang JSON Array ["MGLV", "TRUE", ...], gunakan json.loads
             list_emiten = json.loads(req.text)
             print("Berhasil mengambil data emiten dari Gist.")
         else:
@@ -171,7 +318,6 @@ def get_idx_tickers():
     except Exception as e:
         print(f"Gagal mengambil dari Gist: {e}. Beralih ke fallback.")
     
-    # 3. Fallback ke Excel jika Gist gagal atau kosong
     if not list_emiten:
         try:
             if not os.path.exists(excel_file):
@@ -186,31 +332,25 @@ def get_idx_tickers():
         except Exception as e:
             return jsonify({"error": f"Gist gagal dan pemrosesan Excel Fallback error: {e}"}), 500
 
-    # 4. Validasi dan Pembersihan Format Kode Emiten
-    # Pastikan hanya string dengan 4 huruf (membuang spasi kosong atau data sampah)
     list_emiten = [str(t).upper().strip() for t in list_emiten if len(str(t).strip()) == 4 and str(t).strip().isalpha()]
     
     if not list_emiten:
         return jsonify({"error": "Daftar emiten kosong setelah dibersihkan."}), 400
 
-    # 5. Download Harga Secara Massal melalui yfinance
     try:
+        # TETAP GUNAKAN YFINANCE UNTUK FILTER HARGA AWAL SECARA MASSAL AGAR CEPAT
         tickers_str = " ".join([t + ".JK" for t in list_emiten])
         df_yf = yf.download(tickers_str, period="1d", progress=False)
         hasil = []
         
-        # 6. Filter Berdasarkan Rentang Harga Input Pengguna
         if 'Close' in df_yf:
             df_close = df_yf['Close']
-            
             for t in list_emiten:
                 t_jk = t + ".JK"
                 if t_jk in df_close:
                     saham_data = df_close[t_jk].dropna()
-                    
                     if not saham_data.empty:
                         harga_terakhir = float(saham_data.iloc[-1])
-                        
                         if min_harga <= harga_terakhir <= max_harga:
                             hasil.append(t)
                             
@@ -220,73 +360,6 @@ def get_idx_tickers():
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/saham_us', methods=['GET'])
-def get_saham_us():
-    ticker_symbol = request.args.get('ticker')
-    if not ticker_symbol:
-        return jsonify({"error": "Ticker tidak boleh kosong"}), 400
-    
-    # Saham AS tidak perlu ditambah .JK
-    ticker = ticker_symbol.upper() 
-    
-    try:
-        saham = yf.Ticker(ticker)
-        # Ambil data 1 tahun ke belakang agar perhitungan MA50 dan Timeframe aman
-        df = saham.history(period="1y") 
-        
-        if df.empty:
-            return jsonify({"error": f"Data saham {ticker} tidak ditemukan!"}), 404
-            
-        data_grafik = []
-        for index, row in df.iterrows():
-            data_grafik.append({
-                "time": index.strftime('%Y-%m-%d'),
-                "open": float(row['Open']),
-                "high": float(row['High']),
-                "low": float(row['Low']),
-                "close": float(row['Close']),
-                "volume": int(row['Volume'])
-            })
-            
-        return jsonify(data_grafik)
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/forex', methods=['GET'])
-def get_forex():
-    pair_symbol = request.args.get('pair')
-    if not pair_symbol:
-        return jsonify({"error": "Pair tidak boleh kosong"}), 400
-    
-    # Format forex di yfinance wajib menggunakan akhiran =X (Cth: EURUSD=X)
-    ticker = pair_symbol.upper().strip()
-    if not ticker.endswith('=X'):
-        ticker += '=X'
-    
-    try:
-        forex_data = yf.Ticker(ticker)
-        df = forex_data.history(period="1y")
-        
-        if df.empty:
-            return jsonify({"error": f"Data pair {ticker} tidak ditemukan!"}), 404
-            
-        data_grafik = []
-        for index, row in df.iterrows():
-            data_grafik.append({
-                "time": index.strftime('%Y-%m-%d'),
-                "open": float(row['Open']),
-                "high": float(row['High']),
-                "low": float(row['Low']),
-                "close": float(row['Close']),
-                "volume": int(row['Volume'])
-            })
-            
-        return jsonify(data_grafik)
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    print("🚀 Server berjalan di http://127.0.0.1:5000")
     app.run(debug=True, port=5000)
